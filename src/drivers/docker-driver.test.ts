@@ -10,7 +10,13 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DockerSessionDriver, dockerEventToSessionEvent, ensureDockerRunning } from './docker-driver.js';
+import {
+  DockerSessionDriver,
+  dockerEventToSessionEvent,
+  ensureDockerRunning,
+  isSelfContainer,
+  resolveSelfContainerIdentity,
+} from './docker-driver.js';
 import { FakeCli } from './fake-cli.js';
 import { withSessionEvents } from './session-events.js';
 import { FIXTURE_POLICY, fixtureSpec } from './spec-fixture.js';
@@ -22,7 +28,14 @@ vi.mock('../log.js', () => ({
 
 // The driver re-checks mount sources exist; fixture paths are not real files
 // on the test host. A vi.fn so single tests can flip it to "missing".
-vi.mock('fs', () => ({ default: { existsSync: vi.fn(() => true) } }));
+vi.mock('fs', () => ({
+  default: {
+    existsSync: vi.fn(() => true),
+    readFileSync: vi.fn(() => {
+      throw new Error('ENOENT');
+    }),
+  },
+}));
 
 import fs from 'fs';
 
@@ -43,6 +56,10 @@ function createArgs(): string[] {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(fs.existsSync).mockImplementation(() => true);
+  vi.mocked(fs.readFileSync).mockImplementation(() => {
+    throw new Error('ENOENT');
+  });
   cli = new FakeCli('docker');
   cli.responses = [{ match: /^inspect /, throws: new Error('No such object') }];
 });
@@ -490,6 +507,30 @@ describe('idempotency and adoption', () => {
     expect(cli.joined().some((c) => c === 'rm --force ncl-spike-s1')).toBe(false);
   });
 
+  it('never removes the container NanoClaw itself is running inside (issue #1487)', async () => {
+    // Nested host: residue cleanup must not kill the outer controller even if
+    // its name contains "nanoclaw" and it lacks a session label.
+    vi.spyOn(fs, 'existsSync').mockImplementation((p) => String(p) === '/.dockerenv');
+    vi.spyOn(fs, 'readFileSync').mockImplementation((p) => {
+      if (String(p) === '/proc/self/cgroup') {
+        return '0::/docker/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n';
+      }
+      return '';
+    });
+    cli.responses = [
+      { match: /^inspect /, output: '/amux-nanoclaw-controller\n' },
+      {
+        match: /^ps --filter/,
+        output: 'amux-nanoclaw-controller|\nnanoclaw-v2-agent-one-1700000000000|\nncl-spike-s1|s1\n',
+      },
+    ];
+
+    await driver().reapResidue('spike');
+
+    expect(cli.joined().some((c) => c.includes('rm --force amux-nanoclaw-controller'))).toBe(false);
+    expect(cli.joined()).toContain('rm --force nanoclaw-v2-agent-one-1700000000000');
+  });
+
   it('reaps install-owned networks whose containers are gone', async () => {
     cli.responses = [{ match: /^network ls/, output: 'nc-spike-a-session\nnc-spike-a-uplink\n' }];
 
@@ -506,6 +547,23 @@ describe('idempotency and adoption', () => {
     await driver().reapResidue('spike');
 
     expect(cli.joined().some((c) => c.startsWith('network rm'))).toBe(false);
+  });
+});
+
+describe('self-container identity (issue #1487)', () => {
+  it('matches by name and by short/full id prefix', () => {
+    expect(isSelfContainer('amux-nanoclaw-controller', { name: 'amux-nanoclaw-controller' })).toBe(true);
+    expect(isSelfContainer('/amux-nanoclaw-controller', { name: 'amux-nanoclaw-controller' })).toBe(true);
+    expect(isSelfContainer('abcdef012345', { id: 'abcdef0123456789abcdef0123456789' })).toBe(true);
+    expect(isSelfContainer('other-container', { name: 'amux-nanoclaw-controller', id: 'abcdef' })).toBe(false);
+  });
+
+  it('returns empty identity on a bare host', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    expect(resolveSelfContainerIdentity(cli)).toEqual({});
   });
 });
 

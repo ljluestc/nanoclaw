@@ -19,6 +19,7 @@
  */
 import { createHash } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 
 import { log } from '../log.js';
 
@@ -319,6 +320,13 @@ export class DockerSessionDriver implements SessionDriver {
    * session; this covers a host that died between the two.
    */
   async reapResidue(installSlug: string): Promise<void> {
+    // When NanoClaw itself is running inside a Docker container (nested host),
+    // residue cleanup must never remove that outer container. Older name-based
+    // orphan reapers matched any name containing "nanoclaw" and killed the
+    // controller (issue #1487). Label scoping fixed the common case; this is
+    // the remaining hard backstop for self-named or label-colliding hosts.
+    const self = resolveSelfContainerIdentity(this.#cli);
+
     // Containers first: an auxiliary container whose host died has no owner left
     // to close it. Only non-running ones — an adopted session's are still serving it.
     try {
@@ -336,7 +344,11 @@ export class DockerSessionDriver implements SessionDriver {
         '--format',
         '{{.Names}}',
       ]);
-      const stale = out.trim().split('\n').filter(Boolean);
+      const stale = out
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .filter((name) => !isSelfContainer(name, self));
       for (const name of stale) {
         try {
           this.#cli.run(['rm', '--force', validateRuntimeName(name, 'container')]);
@@ -369,7 +381,8 @@ export class DockerSessionDriver implements SessionDriver {
         .filter(Boolean)
         .map((line) => line.split('|'))
         .filter(([, sessionId]) => !sessionId)
-        .map(([name]) => name);
+        .map(([name]) => name)
+        .filter((name) => !isSelfContainer(name, self));
       for (const name of preSeam) {
         try {
           this.#cli.run(['rm', '--force', validateRuntimeName(name, 'container')]);
@@ -700,6 +713,75 @@ export function assertMountSourcesExist(mounts: readonly MountSpec[]): void {
       });
     }
   }
+}
+
+/**
+ * Identity of the Docker container this process is currently running inside,
+ * if any. Used as a hard backstop so residue cleanup never kills the host
+ * container when NanoClaw is nested (issue #1487).
+ */
+export interface SelfContainerIdentity {
+  /** Full or short container id from cgroup / hostname. */
+  id?: string;
+  /** Docker container name, if resolvable via `docker inspect`. */
+  name?: string;
+}
+
+/**
+ * Detect whether this process is inside a Docker container and, when possible,
+ * resolve that container's id and name. Best-effort: returns `{}` on a bare
+ * host, or when the nested host cannot inspect itself.
+ */
+export function resolveSelfContainerIdentity(cli: Cli = realCli('docker')): SelfContainerIdentity {
+  if (!fs.existsSync('/.dockerenv') && !fs.existsSync('/run/.containerenv')) {
+    // Still allow cgroup-based detection for runtimes that omit /.dockerenv.
+    const fromCgroup = readContainerIdFromCgroup();
+    if (!fromCgroup) return {};
+  }
+
+  const id =
+    readContainerIdFromCgroup() ||
+    (process.env.HOSTNAME && /^[0-9a-f]{12,64}$/i.test(process.env.HOSTNAME) ? process.env.HOSTNAME : undefined) ||
+    (os.hostname() && /^[0-9a-f]{12,64}$/i.test(os.hostname()) ? os.hostname() : undefined);
+
+  if (!id) return {};
+
+  // Prefer the human name when inspect works (e.g. amux-nanoclaw-controller).
+  try {
+    const out = cli.run(['inspect', '--format', '{{.Name}}', id]).trim();
+    // Docker returns "/name"; strip the leading slash.
+    const name = out.replace(/^\//, '');
+    if (name) return { id, name };
+  } catch {
+    /* nested host may lack permission to inspect itself */
+  }
+  return { id };
+}
+
+function readContainerIdFromCgroup(): string | undefined {
+  try {
+    const text = fs.readFileSync('/proc/self/cgroup', 'utf8');
+    // cgroup v1: .../docker/<64-hex>
+    // cgroup v2 / containerd: .../docker-<64-hex>.scope or cri-containerd-<64-hex>.scope
+    const match =
+      /(?:docker|containerd|cri-containerd)[-/]([0-9a-f]{12,64})/i.exec(text) || /\b([0-9a-f]{64})\b/i.exec(text);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when `name` refers to the container this process is running inside. */
+export function isSelfContainer(name: string, self: SelfContainerIdentity): boolean {
+  if (!name) return false;
+  if (self.name && (name === self.name || name === `/${self.name}`)) return true;
+  if (self.id) {
+    // docker ps may show the short id as the name when no explicit --name was set.
+    if (name === self.id || self.id.startsWith(name) || name.startsWith(self.id.slice(0, 12))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Ensure the container runtime is reachable. Fatal at startup — agents cannot run without it. */
