@@ -171,12 +171,32 @@ export function sqliteWriteMessageOut(message: OutboundWrite): number {
   }
 }
 
+/**
+ * Platform-facing message id for an inbound row. The row id is not it: the
+ * router writes messages_in ids as `<platform message id>:<agent group id>`
+ * (messageIdForAgent, src/router.ts), so passing the raw row id to a channel
+ * adapter (edit_message / add_reaction → `operation` delivery) targets a
+ * message the platform has never heard of. Chat-SDK rows carry the platform
+ * id in their serialized content (`content.id`); for rows without it, strip
+ * the router's suffix — it is always the last `:`-separated segment.
+ */
+function inboundPlatformMessageId(row: { id: string; content: string }): string {
+  try {
+    const content = JSON.parse(row.content) as { id?: unknown };
+    if (typeof content.id === 'string' && content.id) return content.id;
+  } catch {
+    // Non-JSON content — fall through to the row-id derivation.
+  }
+  const suffix = row.id.lastIndexOf(':');
+  return suffix > 0 ? row.id.slice(0, suffix) : row.id;
+}
+
 export function sqliteGetMessageIdBySeq(sequence: number): string | null {
   const inbound = getInboundDb();
-  const inboundRow = inbound.prepare('SELECT id FROM messages_in WHERE seq = ?').get(sequence) as
-    | { id: string }
+  const inboundRow = inbound.prepare('SELECT id, content FROM messages_in WHERE seq = ?').get(sequence) as
+    | { id: string; content: string }
     | undefined;
-  if (inboundRow) return inboundRow.id;
+  if (inboundRow) return inboundPlatformMessageId(inboundRow);
   const outboundRow = getOutboundDb().prepare('SELECT id FROM messages_out WHERE seq = ?').get(sequence) as
     | { id: string }
     | undefined;

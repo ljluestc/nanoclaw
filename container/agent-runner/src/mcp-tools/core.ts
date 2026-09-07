@@ -201,12 +201,15 @@ export const editMessage: McpToolDefinition = {
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
-    description: 'Add an emoji reaction to a message.',
+    description:
+      'Add an emoji reaction to a message — an inbound user message or one of your own sent messages. ' +
+      'Prefer a reaction over a text reply for lightweight acknowledgment: eyes = seen / working on it, ' +
+      'white_check_mark = done, thumbs_up = agreed. Platforms may reject emoji outside their supported set.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         messageId: { type: 'integer', description: 'Message ID (the numeric id shown in messages)' },
-        emoji: { type: 'string', description: 'Emoji name (e.g., thumbs_up, heart, check)' },
+        emoji: { type: 'string', description: 'Emoji shortcode name (e.g., thumbs_up, heart, eyes), not the raw character' },
       },
       required: ['messageId', 'emoji'],
     },
